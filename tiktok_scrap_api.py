@@ -1262,6 +1262,34 @@ class LoginRequest(BaseModel):
             raise ValueError('Username must be at least 3 characters')
         return v
 
+class EmailLoginRequest(BaseModel):
+    """Request model for email/password login"""
+    username: str = Field(..., description="ชื่อ profile ที่ต้องการสร้าง")
+    email: str = Field(..., description="Email หรือ username สำหรับ login TikTok")
+    password: str = Field(..., description="รหัสผ่าน TikTok")
+    headless: bool = Field(False, description="รันแบบไม่แสดงหน้าจอ")
+    
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        if not v or len(v) < 3:
+            raise ValueError('Username must be at least 3 characters')
+        return v
+    
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v):
+        if not v or len(v) < 3:
+            raise ValueError('Email must be at least 3 characters')
+        return v
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v):
+        if not v or len(v) < 1:
+            raise ValueError('Password is required')
+        return v
+
 class ScrapeWebhookRequest(BaseModel):
     """Request model for webhook-based scraping"""
     username: str
@@ -1443,6 +1471,50 @@ async def login_confirm(req: LoginRequest, manager: SessionManager = Depends(get
         }
 
     return await manager.run_for_user(req.username, _job)
+
+
+@tiktok_router.post("/login-email-password", response_model=LoginResponse, tags=["TikTok Profiles"], summary="Login TikTok ด้วย Email/Password")
+async def login_with_email_password(req: EmailLoginRequest, manager: SessionManager = Depends(get_manager)):
+    """Login TikTok ด้วย Email และ Password - ถ้าโดน CAPTCHA/OTP ให้ทำในหน้า browser แล้วเรียก /login-confirm"""
+    async def _job(sess: UserSession):
+        scraper = await sess.ensure_scraper(headless=req.headless)
+        
+        is_logged_in = await scraper.check_login_status()
+        if is_logged_in:
+            await sess.cleanup()
+            return {"status": "logged_in", "username_safe": sess.username_safe, "profile_dir": sess.browser_data_dir, "message": "Login อยู่แล้ว", "is_logged_in": True}
+
+        await scraper.page.goto("https://www.tiktok.com/login/phone-or-email/email", wait_until="domcontentloaded", timeout=30000)
+        await scraper.page.wait_for_timeout(2000)
+        
+        try:
+            email_input = await scraper.page.wait_for_selector('input[name="username"], input[type="text"]', timeout=10000)
+            await email_input.fill(req.email)
+            await scraper.page.wait_for_timeout(500)
+            
+            password_input = await scraper.page.wait_for_selector('input[type="password"]', timeout=5000)
+            await password_input.fill(req.password)
+            await scraper.page.wait_for_timeout(500)
+            
+            login_button = await scraper.page.wait_for_selector('button[type="submit"]', timeout=5000)
+            await login_button.click()
+            
+            try:
+                await scraper.page.wait_for_url(lambda url: '/login' not in url, timeout=120000)
+            except:
+                return {"status": "waiting_for_login", "username_safe": sess.username_safe, "profile_dir": sess.browser_data_dir, "message": "รอทำ CAPTCHA/OTP แล้วเรียก /login-confirm", "is_logged_in": False}
+            
+            await scraper.page.wait_for_timeout(3000)
+            if await scraper.check_login_status():
+                await scraper.save_session()
+                await sess.cleanup()
+                return {"status": "success", "username_safe": sess.username_safe, "profile_dir": sess.browser_data_dir, "message": "Login สำเร็จ!", "is_logged_in": True}
+            return {"status": "waiting_for_login", "username_safe": sess.username_safe, "profile_dir": sess.browser_data_dir, "message": "รอ CAPTCHA/OTP แล้วเรียก /login-confirm", "is_logged_in": False}
+        except Exception as e:
+            return {"status": "failed", "username_safe": sess.username_safe, "profile_dir": sess.browser_data_dir, "message": str(e), "is_logged_in": False}
+
+    return await manager.run_for_user(req.username, _job)
+
 
 @tiktok_router.get("/check-login-status/{username}", tags=["TikTok Profiles"])
 async def check_login_status_endpoint(
